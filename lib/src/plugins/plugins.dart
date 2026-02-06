@@ -15,3 +15,8 @@ export 'word_count/word_counter_service.dart';
 export 'pdf/html_to_pdf_encoder.dart';
 export 'blocks/columns/column_block_component.dart';
 export 'blocks/columns/columns_block_component.dart';
+
+export 'code_block/plugin.dart';
+export 'link_preview/plugin.dart';
+export 'video_block/plugin.dart';
+

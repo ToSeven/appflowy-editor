@@ -95,16 +95,24 @@ class UndoManager {
       : undoStack = FixedSizeStack(stackSize),
         redoStack = FixedSizeStack(stackSize);
 
-  HistoryItem getUndoHistoryItem() {
+  HistoryItem getUndoHistoryItem({
+    bool currentHistoryItemSealedClearRedoStack = true,
+  }) {
     if (undoStack.isEmpty) {
       final item = HistoryItem();
       undoStack.push(item);
+
+      if (currentHistoryItemSealedClearRedoStack) {
+        redoStack.clear();
+      }
 
       return item;
     }
     final last = undoStack.last;
     if (last.sealed) {
-      redoStack.clear();
+      if (currentHistoryItemSealedClearRedoStack) {
+        redoStack.clear();
+      }
       final item = HistoryItem();
       undoStack.push(item);
 
@@ -150,6 +158,7 @@ class UndoManager {
       options: const ApplyOptions(
         recordUndo: true,
         recordRedo: false,
+        clearRedoStack: false,
       ),
     );
   }

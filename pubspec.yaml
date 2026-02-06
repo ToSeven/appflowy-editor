@@ -35,6 +35,16 @@ dependencies:
   universal_platform: ^1.1.0
   url_launcher: "^6.1.11"
 
+  flutter_link_previewer: ^3.2.2
+
+  # Code Block Plugin
+  highlight: ^0.7.0
+
+  # Video Plugin
+  media_kit: ^1.1.10+1
+  media_kit_libs_video: ^1.0.4
+  media_kit_video: ^1.2.4
+
 dev_dependencies:
   awesome_lints:
     git:

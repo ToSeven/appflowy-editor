@@ -22,26 +22,42 @@ class HTMLImageNodeParser extends HTMLNodeParser {
     Node node, {
     required List<HTMLNodeParser> encodeParsers,
   }) {
-    final anchor = dom.Element.tag(HTMLTags.image);
-    anchor.attributes['src'] = node.attributes[ImageBlockKeys.url];
-
+    final url = node.attributes[ImageBlockKeys.url] ?? '';
+    final alt = node.attributes[ImageBlockKeys.alt] ?? '';
     final height = node.attributes[ImageBlockKeys.height];
-    if (height != null) {
-      anchor.attributes['height'] = height.toString();
-    }
-
     final width = node.attributes[ImageBlockKeys.width];
+    final align = node.attributes[ImageBlockKeys.align] as String?;
+
+    final img = dom.Element.tag(HTMLTags.image)
+      ..attributes['src'] = url
+      ..attributes['alt'] = alt;
+
+    if (height != null) {
+      img.attributes['height'] = height.toString();
+    }
     if (width != null) {
-      anchor.attributes['width'] = width.toString();
+      img.attributes['width'] = width.toString();
     }
 
-    final align = node.attributes[ImageBlockKeys.align];
-    if (align != null) {
-      anchor.attributes['align'] = align;
+    // Wrap in a <div> with CSS text-align instead of the deprecated
+    // <img align="..."> attribute (removed in HTML5).
+    if (align == 'left' || align == 'right') {
+      final wrapper = dom.Element.tag('div')
+        ..attributes['style'] = 'text-align:$align';
+      wrapper.append(img);
+      return [
+        wrapper,
+        ...processChildrenNodes(
+          node.children.toList(),
+          encodeParsers: encodeParsers,
+        ),
+      ];
     }
 
+    // center or null — center is the default for <div>, so we don't need
+    // an explicit wrapper.
     return [
-      anchor,
+      img,
       ...processChildrenNodes(
         node.children.toList(),
         encodeParsers: encodeParsers,

@@ -2,74 +2,16 @@ import 'dart:async';
 
 import 'package:appflowy_editor/appflowy_editor.dart';
 import 'code_block_actions.dart';
+import 'code_block_languages.dart';
 import 'code_block_localization.dart';
 import 'code_block_style.dart';
 import '../utils/string_ext.dart';
 import 'package:flutter/material.dart';
 import 'package:highlight/highlight.dart' as highlight;
-import 'package:highlight/languages/all.dart';
 import 'package:provider/provider.dart';
 import 'package:universal_platform/universal_platform.dart';
 
 import 'code_block_themes.dart';
-
-final allCodeBlockLanguages = [
-  'Assembly',
-  'Bash',
-  'BASIC',
-  'C',
-  'C#',
-  'CPP',
-  'Clojure',
-  'CS',
-  'CSS',
-  'Dart',
-  'Delphi',
-  'DockerFile',
-  'Elixir',
-  'Elm',
-  'Erlang',
-  'Fortran',
-  'Go',
-  'GraphQL',
-  'Haskell',
-  'HTML',
-  'Java',
-  'JavaScript',
-  'JSON',
-  'Kotlin',
-  'LaTeX',
-  'Lisp',
-  'Lua',
-  'Markdown',
-  'MATLAB',
-  'Objective-C',
-  'OCaml',
-  'Perl',
-  'PHP',
-  'PowerShell',
-  'Python',
-  'R',
-  'Ruby',
-  'Rust',
-  'Scala',
-  'Shell',
-  'SQL',
-  'Swift',
-  'TypeScript',
-  'Visual Basic',
-  'XML',
-  'YAML',
-];
-
-final defaultCodeBlockSupportedLanguages = allCodeBlockLanguages
-    .map((e) => e.toLowerCase())
-    .toSet()
-    .intersection(allLanguages.keys.toSet())
-    .toList()
-  ..add('auto')
-  ..add('c')
-  ..sort();
 
 class CodeBlockKeys {
   const CodeBlockKeys._();
@@ -85,15 +27,22 @@ class CodeBlockKeys {
   ///
   /// The value is a String.
   static const String language = 'language';
+
+  /// Optional indent size (int) for the code block.
+  ///
+  /// When absent, shortcut handlers default to 2 spaces.
+  static const String indentSize = 'indent_size';
 }
 
 Node codeBlockNode({
   Delta? delta,
   String? language,
+  int? indentSize,
 }) {
   final attributes = {
     CodeBlockKeys.delta: (delta ?? Delta()).toJson(),
     CodeBlockKeys.language: language,
+    if (indentSize != null) CodeBlockKeys.indentSize: indentSize,
   };
   return Node(
     type: CodeBlockKeys.type,
@@ -296,7 +245,6 @@ class _CodeBlockComponentWidgetState extends State<CodeBlockComponentWidget>
   final codeBlockKey = GlobalKey();
 
   String? get language => node.attributes[CodeBlockKeys.language] as String?;
-  String? autoDetectLanguage;
 
   bool isSelected = false;
   bool isHovering = false;
@@ -310,6 +258,23 @@ class _CodeBlockComponentWidgetState extends State<CodeBlockComponentWidget>
 
   late final StreamSubscription<dynamic> transactionSubscription;
 
+  // --- Highlight memoization ------------------------------------------------
+  // Parsing the syntax tree and converting it to TextSpans runs on the UI
+  // thread and is expensive. We cache the result keyed by (content, language,
+  // brightness) so that rebuilds triggered by unrelated state (hover, selection
+  // changes, foreign transactions) do not re-parse.
+  String? _highlightedContent;
+  String? _highlightedLanguage;
+  bool? _highlightedIsLight;
+  List<TextSpan> _highlightedSpans = const [];
+
+  // Last observed content/language, used to filter the global transaction
+  // stream so only transactions that actually touched THIS node trigger a
+  // rebuild. Without this, every code block in the document rebuilds on each
+  // keystroke typed anywhere.
+  String? _lastContent;
+  String? _lastLanguage;
+
   @override
   void initState() {
     super.initState();
@@ -317,12 +282,20 @@ class _CodeBlockComponentWidgetState extends State<CodeBlockComponentWidget>
 
     editorState.selectionService.registerGestureInterceptor(interceptor);
     editorState.selectionNotifier.addListener(calculateScrollPosition);
-    transactionSubscription = editorState.transactionStream.listen((event) {
-      // Simplified approach: just call calculateScrollPosition
-      // This ensures compatibility with both old and new transaction formats
+    _lastContent = node.delta?.toPlainText();
+    _lastLanguage = language;
+    transactionSubscription = editorState.transactionStream.listen((_) {
+      // The selection-based scroll handling is cheap (it self-no-ops via
+      // addPostFrameCallback + path checks), but we must avoid the expensive
+      // setState -> rebuild -> re-parse path unless THIS node actually changed.
       calculateScrollPosition();
-      // Trigger rebuild to update line numbers
-      setState(() {});
+      final content = node.delta?.toPlainText();
+      final lang = language;
+      if (content != _lastContent || lang != _lastLanguage) {
+        _lastContent = content;
+        _lastLanguage = lang;
+        if (mounted) setState(() {});
+      }
     });
   }
 
@@ -352,59 +325,113 @@ class _CodeBlockComponentWidgetState extends State<CodeBlockComponentWidget>
     final textDirection = calculateTextDirection(
       layoutDirection: Directionality.maybeOf(context),
     );
+    final colorScheme = Theme.of(context).colorScheme;
+    final isLight = Theme.of(context).brightness == Brightness.light;
+
+    // --- Resolved surface colors ------------------------------------------------
+    // The code block uses a layered surface: a body background and a slightly
+    // differentiated header band so the controls read as chrome, not content.
+    final bgColor = widget.style?.backgroundColor ??
+        (isLight
+            ? colorScheme.surfaceContainerHighest
+            : colorScheme.surfaceContainerLow);
+    final headerBg = widget.style?.headerBackgroundColor ??
+        (isLight
+            ? _CodeBlockColorUtils.darken(bgColor, 0.018)
+            : _CodeBlockColorUtils.lighten(bgColor, 0.04));
+    final borderColor = widget.style?.borderColor ??
+        colorScheme.outline.withAlpha(isLight ? 0x33 : 0x55); // ~0.2 / ~0.33
+    final radius = widget.style?.radius ?? 10.0;
+    final border = BorderSide(color: borderColor, width: 1.0);
 
     Widget child = MouseRegion(
       onEnter: (_) => setState(() => isHovering = true),
       onExit: (_) => setState(() => isHovering = false),
       child: DecoratedBox(
         decoration: BoxDecoration(
-          borderRadius: const BorderRadius.all(Radius.circular(8.0)),
-          color: widget.style?.backgroundColor ??
-              Theme.of(context).colorScheme.secondaryContainer,
+          borderRadius: BorderRadius.all(Radius.circular(radius)),
+          color: bgColor,
+          border: Border.fromBorderSide(border),
+          // Subtle elevation on desktop/web only — skipped on mobile to keep
+          // repaint cost low.
+          boxShadow: UniversalPlatform.isDesktopOrWeb
+              ? [
+                  BoxShadow(
+                    color: Colors.black.withAlpha(isLight ? 0x08 : 0x18),
+                    blurRadius: 6,
+                    offset: const Offset(0, 1),
+                  ),
+                ]
+              : null,
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          textDirection: textDirection,
-          children: [
-            MouseRegion(
-              onEnter: (_) => setState(() => canPanStart = false),
-              onExit: (_) => setState(() => canPanStart = true),
-              child: Opacity(
-                opacity: 1.0,
-                child: Row(
-                  children: [
-                    _LanguageSelector(
-                      editorState: editorState,
-                      language: language,
-                      isSelected: isSelected,
-                      onLanguageSelected: (language) {
-                        updateLanguage(language);
-                        widget.actions.onLanguageChanged?.call(language);
-                      },
-                      onMenuOpen: () => isSelected = true,
-                      onMenuClose: () => setState(() => isSelected = false),
-                      languagePickerBuilder: widget.languagePickerBuilder,
-                      localizations: widget.localizations,
-                    ),
-                    const Spacer(),
-                    if (widget.actions.onCopy != null &&
-                        widget.copyButtonBuilder == null) ...[
-                      _CopyButton(
-                        node: node,
-                        onCopy: widget.actions.onCopy!,
-                        localizations: widget.localizations,
-                        foregroundColor: widget.style?.foregroundColor,
+        child: ClipRRect(
+          // Clip children so the header band + scroll area honor the radius.
+          borderRadius: BorderRadius.all(Radius.circular(radius)),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            textDirection: textDirection,
+            children: [
+              // --- Header band ---------------------------------------------------
+              MouseRegion(
+                onEnter: (_) => setState(() => canPanStart = false),
+                onExit: (_) => setState(() => canPanStart = true),
+                child: Container(
+                  height: 38,
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  decoration: BoxDecoration(
+                    color: headerBg,
+                    border: Border(
+                      bottom: BorderSide(
+                        color: borderColor,
+                        width: 1.0,
                       ),
-                    ] else if (widget.copyButtonBuilder != null) ...[
-                      widget.copyButtonBuilder!(editorState, node),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      // Flexible lets the selector shrink when the selected
+                      // language label is long, so it never overflows the
+                      // header row. Inner Text uses ellipsis as a fallback.
+                      Flexible(
+                        child: _LanguageSelector(
+                          editorState: editorState,
+                          language: language,
+                          isSelected: isSelected,
+                          onLanguageSelected: (language) {
+                            updateLanguage(language);
+                            widget.actions.onLanguageChanged?.call(language);
+                          },
+                          onMenuOpen: () => isSelected = true,
+                          onMenuClose: () => setState(() => isSelected = false),
+                          languagePickerBuilder: widget.languagePickerBuilder,
+                          localizations: widget.localizations,
+                        ),
+                      ),
+                      const Spacer(),
+                      if (widget.actions.onCopy != null &&
+                          widget.copyButtonBuilder == null) ...[
+                        _CopyButton(
+                          node: node,
+                          onCopy: widget.actions.onCopy!,
+                          localizations: widget.localizations,
+                          foregroundColor: widget.style?.foregroundColor,
+                        ),
+                      ] else if (widget.copyButtonBuilder != null) ...[
+                        widget.copyButtonBuilder!(editorState, node),
+                      ],
                     ],
-                  ],
+                  ),
                 ),
               ),
-            ),
-            _buildCodeBlock(context, textDirection),
-          ],
+              // Isolate repaints (hover/selection/highlight) from the rest of
+              // the document so a single code block does not trigger a full
+              // editor repaint.
+              RepaintBoundary(
+                child: _buildCodeBlock(context, textDirection),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -437,36 +464,38 @@ class _CodeBlockComponentWidgetState extends State<CodeBlockComponentWidget>
 
   Widget _buildCodeBlock(BuildContext context, TextDirection textDirection) {
     final isLightMode = Theme.of(context).brightness == Brightness.light;
+    final colorScheme = Theme.of(context).colorScheme;
     final delta = node.delta ?? Delta();
     final content = delta.toPlainText();
 
-    final result = highlight.highlight.parse(
-      content,
-      language: language,
-      autoDetection: language == null,
-    );
-
-    autoDetectLanguage = language ?? result.language;
-
-    final codeNodes = result.nodes;
-    if (codeNodes == null) {
-      throw Exception('Code block parse error.');
-    }
-
-    final codeTextSpans = _convert(codeNodes, isLightMode: isLightMode);
+    final codeTextSpans = _resolveHighlightedSpans(content, isLightMode);
 
     // Calculate lines of code dynamically
     final linesOfCode = content.isEmpty ? 1 : content.split('\n').length;
 
-    // Define textStyle based on editor style configuration
+    // Define textStyle based on editor style configuration.
+    // Flutter's [TextStyle.fontFamily] does NOT accept a CSS-style fallback
+    // list ("A, B, C"); it must be a single name with [fontFamilyFallback].
     final textStyle =
         editorState.editorStyle.textStyleConfiguration.text.copyWith(
-      fontSize: 14,
-      fontFamily: 'Monaco, Menlo, Consolas, monospace',
+      fontSize: 13.5,
+      height: 1.55,
+      fontFamily: 'Monaco',
+      fontFamilyFallback: const ['Menlo', 'Consolas', 'Courier New', 'monospace'],
     );
 
+    // Intentional, tighter body padding: horizontal 14, top 14, bottom 18.
+    final innerPadding = widget.style?.padding ??
+        const EdgeInsets.fromLTRB(14, 14, 14, 18);
+
+    // Gutter separator + muted digits. ~35% onSurface reads as chrome.
+    final gutterColor = widget.style?.gutterColor ??
+        colorScheme.onSurface.withAlpha(isLightMode ? 0x59 : 0x66);
+    final separatorColor =
+        colorScheme.outline.withAlpha(isLightMode ? 0x26 : 0x40);
+
     return Padding(
-      padding: widget.padding,
+      padding: innerPadding,
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -475,12 +504,11 @@ class _CodeBlockComponentWidgetState extends State<CodeBlockComponentWidget>
               key: ValueKey('lines-$linesOfCode'),
               linesOfCode: linesOfCode,
               textStyle: textStyle.copyWith(
-                color: widget.style?.foregroundColor ??
-                    Theme.of(context)
-                        .colorScheme
-                        .onSecondaryContainer
-                        .withAlpha(155),
+                color: gutterColor,
+                // Tabular figures keep digits column-aligned.
+                fontFeatures: const [FontFeature.tabularFigures()],
               ),
+              separatorColor: separatorColor,
             ),
           ],
           Flexible(
@@ -489,7 +517,7 @@ class _CodeBlockComponentWidgetState extends State<CodeBlockComponentWidget>
               child: SingleChildScrollView(
                 key: codeBlockKey,
                 controller: scrollController,
-                padding: const EdgeInsets.only(bottom: 16),
+                padding: const EdgeInsets.only(bottom: 4),
                 physics: const ClampingScrollPhysics(),
                 scrollDirection: Axis.horizontal,
                 child: AppFlowyRichText(
@@ -498,7 +526,7 @@ class _CodeBlockComponentWidgetState extends State<CodeBlockComponentWidget>
                   node: widget.node,
                   editorState: editorState,
                   placeholderText: placeholderText,
-                  lineHeight: 1.5,
+                  lineHeight: 1.55,
                   textSpanDecorator: (_) =>
                       TextSpan(style: textStyle, children: codeTextSpans),
                   placeholderTextSpanDecorator: (textSpan) => textSpan,
@@ -512,6 +540,44 @@ class _CodeBlockComponentWidgetState extends State<CodeBlockComponentWidget>
         ],
       ),
     );
+  }
+
+  /// Returns the syntax-highlighted [TextSpan] children for [content],
+  /// memoized on the tuple (content, language, isLightMode) so that rebuilds
+  /// not caused by an actual content/language change skip re-parsing.
+  ///
+  /// Parsing failures (unknown language, parser exceptions) never crash the
+  /// build: they fall back to a single plain [TextSpan] wrapping the content.
+  List<TextSpan> _resolveHighlightedSpans(String content, bool isLightMode) {
+    if (content == _highlightedContent &&
+        language == _highlightedLanguage &&
+        isLightMode == _highlightedIsLight) {
+      return _highlightedSpans;
+    }
+
+    List<TextSpan> spans;
+    try {
+      final result = highlight.highlight.parse(
+        content,
+        language: language,
+        autoDetection: language == null,
+      );
+      final codeNodes = result.nodes;
+      if (codeNodes == null || codeNodes.isEmpty) {
+        spans = [TextSpan(text: content)];
+      } else {
+        spans = _convert(codeNodes, isLightMode: isLightMode);
+      }
+    } catch (_) {
+      // Never let a highlighter failure red-screen the editor.
+      spans = [TextSpan(text: content)];
+    }
+
+    _highlightedContent = content;
+    _highlightedLanguage = language;
+    _highlightedIsLight = isLightMode;
+    _highlightedSpans = spans;
+    return spans;
   }
 
   Future<void> updateLanguage(String language) async {
@@ -580,7 +646,11 @@ class _CodeBlockComponentWidgetState extends State<CodeBlockComponentWidget>
     List<TextSpan> currentSpans = spans;
     final List<List<TextSpan>> stack = [];
 
-    final cbTheme = isLightMode ? lightThemeInCodeblock : darkThemeInCodeBlock;
+    // Resolve the highlight theme, honoring an optional override supplied via
+    // CodeBlockStyle so the code block can follow the host app's dynamic theme.
+    final cbTheme = isLightMode
+        ? (widget.style?.lightTheme ?? lightThemeInCodeblock)
+        : (widget.style?.darkTheme ?? darkThemeInCodeBlock);
 
     void traverse(highlight.Node node) {
       if (node.value != null) {
@@ -619,27 +689,41 @@ class _LinesOfCodeNumbers extends StatelessWidget {
     super.key,
     required this.linesOfCode,
     required this.textStyle,
+    required this.separatorColor,
   });
 
   final int linesOfCode;
   final TextStyle textStyle;
+  final Color separatorColor;
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
+    // Render all line numbers as a single Text instead of one Text widget per
+    // line. For large code blocks this collapses thousands of child elements
+    // into one, dramatically shrinking the element tree.
+    final buffer = StringBuffer();
+    for (int i = 1; i <= linesOfCode; i++) {
+      if (i > 1) buffer.write('\n');
+      buffer.write(i);
+    }
+    return Container(
       padding: const EdgeInsets.only(right: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          for (int i = 1; i <= linesOfCode; i++)
-            Text(i.toString(), style: textStyle),
-        ],
+      decoration: BoxDecoration(
+        border: Border(
+          right: BorderSide(color: separatorColor, width: 1.0),
+        ),
+      ),
+      margin: const EdgeInsets.only(right: 12),
+      child: Text(
+        buffer.toString(),
+        style: textStyle,
+        textAlign: TextAlign.right,
       ),
     );
   }
 }
 
-class _CopyButton extends StatelessWidget {
+class _CopyButton extends StatefulWidget {
   const _CopyButton({
     required this.node,
     required this.onCopy,
@@ -653,23 +737,56 @@ class _CopyButton extends StatelessWidget {
   final Color? foregroundColor;
 
   @override
+  State<_CopyButton> createState() => _CopyButtonState();
+}
+
+class _CopyButtonState extends State<_CopyButton> {
+  bool _hovered = false;
+  bool _justCopied = false;
+
+  @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(4),
-      child: Tooltip(
-        message: localizations.copyTooltip,
-        child: IconButton(
-          onPressed: () {
-            final delta = node.delta?.toPlainText();
+    final colorScheme = Theme.of(context).colorScheme;
+    final baseColor =
+        widget.foregroundColor ?? colorScheme.onSurface.withAlpha(0xCC);
+    final iconColor = _hovered ? colorScheme.onSurface : baseColor;
+    final bgColor = _hovered
+        ? colorScheme.onSurface.withAlpha(0x0F)
+        : Colors.transparent;
+
+    return Tooltip(
+      message: widget.localizations.copyTooltip,
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: GestureDetector(
+          onTap: () {
+            final delta = widget.node.delta?.toPlainText();
             if (delta != null) {
-              onCopy(delta);
+              widget.onCopy(delta);
+              setState(() => _justCopied = true);
+              Future.delayed(const Duration(milliseconds: 1200), () {
+                if (mounted) setState(() => _justCopied = false);
+              });
             }
           },
-          hoverColor: Theme.of(context).colorScheme.secondaryContainer,
-          icon: Icon(
-            Icons.copy,
-            color: foregroundColor ??
-                Theme.of(context).colorScheme.onSecondaryContainer,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 120),
+            curve: Curves.easeOut,
+            width: 28,
+            height: 28,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: bgColor,
+              borderRadius: BorderRadius.circular(7),
+            ),
+            child: Icon(
+              _justCopied ? Icons.check_rounded : Icons.copy_rounded,
+              size: 15,
+              color: _justCopied
+                  ? colorScheme.primary
+                  : iconColor,
+            ),
           ),
         ),
       ),
@@ -756,94 +873,198 @@ class _LanguageSelectionDropdown extends StatefulWidget {
 class _LanguageSelectionDropdownState
     extends State<_LanguageSelectionDropdown> {
   bool _isHovered = false;
+  final MenuController _menuController = MenuController();
+
+  // Cache of MenuItemButton widgets keyed on (language, brightness).
+  String? _cachedLang;
+  bool? _cachedIsDark;
+  late List<MenuItemButton> _menuChildren;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _ensureItemCache(Theme.of(context).brightness == Brightness.dark);
+  }
+
+  @override
+  void didUpdateWidget(covariant _LanguageSelectionDropdown oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.language != widget.language ||
+        oldWidget.supportedLanguages != widget.supportedLanguages ||
+        oldWidget.localizations != widget.localizations) {
+      _rebuildItemCache(Theme.of(context).brightness == Brightness.dark);
+    }
+  }
+
+  void _ensureItemCache(bool isDarkMode) {
+    final currentLanguage = widget.language ?? 'auto';
+    if (currentLanguage != _cachedLang || isDarkMode != _cachedIsDark) {
+      _rebuildItemCache(isDarkMode);
+    }
+  }
+
+  void _rebuildItemCache(bool isDarkMode) {
+    final currentLanguage = widget.language ?? 'auto';
+    final labelOf = (String lang) => lang == 'auto'
+        ? widget.localizations.autoLanguage
+        : lang.capitalize();
+
+    _menuChildren = widget.supportedLanguages.map((lang) {
+      final isSelected = lang == currentLanguage;
+      return MenuItemButton(
+        onPressed: () {
+          widget.onLanguageSelected(lang);
+          widget.onMenuClose?.call();
+        },
+        trailingIcon: isSelected
+            ? Icon(
+                Icons.check,
+                size: 14,
+                color: isDarkMode
+                    ? const Color(0xFF93C5FD)
+                    : const Color(0xFF1D4ED8),
+              )
+            : null,
+        child: Text(
+          labelOf(lang),
+          style: TextStyle(
+            fontSize: 12,
+            fontFamily: 'Monaco',
+            fontFamilyFallback: const ['Menlo', 'Consolas', 'monospace'],
+            color: isDarkMode
+                ? const Color(0xFFD4D4D4)
+                : const Color(0xFF333333),
+          ),
+        ),
+      );
+    }).toList();
+
+    _cachedLang = currentLanguage;
+    _cachedIsDark = isDarkMode;
+  }
 
   @override
   Widget build(BuildContext context) {
     final isDarkMode = Theme.of(context).brightness == Brightness.dark;
+    final colorScheme = Theme.of(context).colorScheme;
+    _ensureItemCache(isDarkMode);
     final currentLanguage = widget.language ?? 'auto';
+    final label = currentLanguage == 'auto'
+        ? widget.localizations.autoLanguage
+        : currentLanguage.capitalize();
 
-    return Padding(
-      padding: const EdgeInsets.only(left: 4, top: 4),
-      child: MouseRegion(
-        onEnter: (_) => setState(() => _isHovered = true),
-        onExit: (_) => setState(() => _isHovered = false),
-        child: AnimatedContainer(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          decoration: BoxDecoration(
-            color: _isHovered
-                ? Theme.of(context).colorScheme.secondaryContainer
-                : Colors.transparent,
-            borderRadius: BorderRadius.circular(12),
+    // Resting pill is a soft ghost; on hover it lifts to a clearer surface.
+    final pillBg = _isHovered
+        ? colorScheme.onSurface.withAlpha(0x10)
+        : colorScheme.onSurface.withAlpha(0x07);
+    final labelColor = colorScheme.onSurface.withAlpha(isDarkMode ? 0xB3 : 0x99);
+
+    return MouseRegion(
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      // MenuAnchor (Material 3) replaces DropdownButton. The trigger widget is
+      // 100% custom — it does NOT depend on DropdownButton's internal
+      // `mainAxisSize.min` Row + `isExpanded` flex algorithm, which is
+      // notoriously hard to constrain. Here the trigger width is deterministic:
+      //   ConstrainedBox(maxWidth: 104) on the Text directly → short labels
+      //   render at natural width (compact pill), long labels ellipsize.
+      // The popup menu width is independent (sized by its own menuChildren).
+      child: MenuAnchor(
+        controller: _menuController,
+        menuChildren: _menuChildren,
+        style: MenuStyle(
+          backgroundColor: WidgetStatePropertyAll(
+            isDarkMode ? const Color(0xFF1E1E1E) : Colors.white,
           ),
-          duration: Duration.zero,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 1, vertical: 2),
-            child: DropdownButtonHideUnderline(
-              child: DropdownButton<String>(
-                icon: const SizedBox.shrink(),
-                isDense: true,
-                value: currentLanguage,
-                dropdownColor:
-                    isDarkMode ? const Color(0xFF1E1E1E) : Colors.white,
-                borderRadius: BorderRadius.circular(12),
-                focusColor: Colors.transparent,
-                selectedItemBuilder: (context) {
-                  return widget.supportedLanguages.map((lang) {
-                    return Center(
-                        child: Text(
-                      lang == 'auto'
-                          ? widget.localizations.autoLanguage
-                          : lang.capitalize(),
-                    ));
-                  }).toList();
-                },
-                items: widget.supportedLanguages.map((lang) {
-                  final isSelected = lang == currentLanguage;
-                  return DropdownMenuItem<String>(
-                    value: lang,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 8),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: Row(
-                        children: [
-                          Flexible(
-                            child: Text(
-                              lang == 'auto'
-                                  ? widget.localizations.autoLanguage
-                                  : lang.capitalize(),
-                            ),
-                          ),
-                          if (isSelected) ...[
-                            const SizedBox(width: 6),
-                            Icon(
-                              Icons.check,
-                              size: 14,
-                              color: isSelected
-                                  ? (isDarkMode
-                                      ? const Color(0xFF93C5FD)
-                                      : const Color(0xFF1D4ED8))
-                                  : Colors.transparent,
-                            ),
-                          ],
-                        ],
-                      ),
-                    ),
-                  );
-                }).toList(),
-                onChanged: (value) {
-                  if (value != null) {
-                    widget.onLanguageSelected(value);
-                    widget.onMenuClose?.call();
-                  }
-                },
-              ),
+          shape: WidgetStatePropertyAll(
+            RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
             ),
           ),
+          elevation: const WidgetStatePropertyAll(6),
         ),
+        builder: (context, controller, child) {
+          return GestureDetector(
+            onTap: () {
+              if (controller.isOpen) {
+                controller.close();
+                widget.onMenuClose?.call();
+              } else {
+                widget.onMenuOpen?.call();
+                controller.open();
+              }
+            },
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 120),
+              curve: Curves.easeOut,
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              constraints: const BoxConstraints(maxWidth: 150),
+              decoration: BoxDecoration(
+                color: pillBg,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 104),
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      softWrap: false,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontFamily: 'Monaco',
+                        fontFamilyFallback: const [
+                          'Menlo',
+                          'Consolas',
+                          'monospace',
+                        ],
+                        color: labelColor,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  Icon(
+                    Icons.keyboard_arrow_down_rounded,
+                    size: 14,
+                    color: labelColor,
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
       ),
+    );
+  }
+}
+
+/// Tiny HSL-based color helpers for deriving layered surface tints.
+///
+/// We avoid pulling in extra packages; this is the minimal math needed to
+/// darken/lighten a color for the header band.
+class _CodeBlockColorUtils {
+  const _CodeBlockColorUtils._();
+
+  /// Returns [color] mixed with black by [amount] (0.0..1.0).
+  static Color darken(Color color, double amount) {
+    final f = amount.clamp(0.0, 1.0);
+    return Color.alphaBlend(
+      Colors.black.withValues(alpha: f),
+      color,
+    );
+  }
+
+  /// Returns [color] mixed with white by [amount] (0.0..1.0).
+  static Color lighten(Color color, double amount) {
+    final f = amount.clamp(0.0, 1.0);
+    return Color.alphaBlend(
+      Colors.white.withValues(alpha: f),
+      color,
     );
   }
 }

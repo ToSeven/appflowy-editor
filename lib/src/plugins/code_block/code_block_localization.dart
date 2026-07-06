@@ -14,6 +14,7 @@ class CodeBlockLocalizations {
     this.copyTooltip = "Copy contents of the code block",
     this.codeBlockAddTwoSpaces =
         "Add two spaces at cursor position in code block",
+    this.codeBlockToggleComment = "Toggle line comment in code block",
   });
 
   // Shortcut descriptions
@@ -23,6 +24,7 @@ class CodeBlockLocalizations {
   final String codeBlockSelectAll;
   final String codeBlockPasteText;
   final String codeBlockAddTwoSpaces;
+  final String codeBlockToggleComment;
 
   final String language;
   final String languagePlaceholder;

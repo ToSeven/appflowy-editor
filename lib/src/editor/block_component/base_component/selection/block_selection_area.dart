@@ -115,13 +115,41 @@ class _BlockSelectionAreaState extends State<BlockSelectionArea> {
             widget.node,
           );
 
+          // --- Mask + shadow selection effect -------------------------------
+          // When blockColor is explicitly configured (non-transparent), it
+          // tints the mask; otherwise a theme-aware subtle mask is derived so
+          // the effect is visible in both light and dark themes without any
+          // extra configuration.
+          final theme = Theme.of(context);
+          final colorScheme = theme.colorScheme;
+          final isDark = theme.brightness == Brightness.dark;
+          final hasExplicitColor = widget.blockColor.opacity > 0.0;
+          final maskColor = hasExplicitColor
+              ? widget.blockColor
+              : (isDark
+                  ? colorScheme.onSurface.withValues(alpha: 0.07)
+                  : colorScheme.onSurface.withValues(alpha: 0.04));
+
           return Positioned.fromRect(
             rect: prevBlockRect!,
             child: Container(
               margin: padding,
               decoration: BoxDecoration(
-                color: widget.blockColor,
-                borderRadius: BorderRadius.circular(4),
+                color: maskColor,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(
+                  color: colorScheme.primary.withValues(alpha: 0.18),
+                  width: 1.0,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: isDark
+                        ? Colors.black.withValues(alpha: 0.35)
+                        : colorScheme.primary.withValues(alpha: 0.10),
+                    blurRadius: 10,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
               ),
             ),
           );

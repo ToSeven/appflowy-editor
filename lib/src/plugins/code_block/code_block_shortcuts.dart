@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'package:appflowy_editor/appflowy_editor.dart';
@@ -21,6 +23,7 @@ List<CommandShortcutEvent> codeBlockCommands({
       tabToInsertSpacesInCodeBlockCommand(localizations.codeBlockIndentLines),
       tabToDeleteSpacesInCodeBlockCommand(localizations.codeBlockOutdentLines),
       tabSpacesAtCurosrInCodeBlockCommand(localizations.codeBlockAddTwoSpaces),
+      toggleCommentInCodeBlockCommand(localizations.codeBlockToggleComment),
     ];
 
 /// Press the enter key in code block to insert a new line in it.
@@ -152,6 +155,23 @@ CommandShortcutEvent pasteInCodeblock(
       handler: _pasteInCodeBlock,
     );
 
+/// ctrl + / (cmd + / on macOS) to toggle line comments in a code block.
+///
+/// The comment syntax is chosen based on the block's language (`#` for
+/// python/bash/ruby/etc., `//` for the rest as a sane default).
+///
+/// - support
+///   - desktop
+///   - web
+CommandShortcutEvent toggleCommentInCodeBlockCommand(String description) =>
+    CommandShortcutEvent(
+      key: 'toggle line comment in code block',
+      command: 'ctrl+/',
+      macOSCommand: 'cmd+/',
+      getDescription: () => description,
+      handler: _toggleCommentInCodeBlockCommandHandler,
+    );
+
 CharacterShortcutEventHandler _enterInCodeBlockCommandHandler =
     (editorState) async {
   final selection = editorState.selection;
@@ -249,8 +269,11 @@ KeyEventResult _addTwoSpacesInCodeBlockCommandHandler(
     return KeyEventResult.ignored;
   }
 
+  final indentSize = node.attributes[CodeBlockKeys.indentSize] as int? ?? 2;
+  final spaces = ' ' * indentSize;
+
   final transaction = editorState.transaction
-    ..insertText(node, selection.end.offset, '  ');
+    ..insertText(node, selection.end.offset, spaces);
 
   editorState.apply(transaction);
 
@@ -271,7 +294,8 @@ KeyEventResult _indentationInCodeBlockCommandHandler(
     return KeyEventResult.ignored;
   }
 
-  const spaces = '  ';
+  final indentSize = node.attributes[CodeBlockKeys.indentSize] as int? ?? 2;
+  final spaces = ' ' * indentSize;
   final lines = delta.toPlainText().split('\n');
   int index = 0;
 
@@ -281,10 +305,12 @@ KeyEventResult _indentationInCodeBlockCommandHandler(
   bool selectionStartsAtLineStart = false;
 
   for (final line in lines) {
-    if (!shouldIndent && line.startsWith(spaces) || shouldIndent) {
-      bool shouldTransform = false;
-
-      shouldTransform = index + line.length >= selection.startIndex &&
+    // When indenting, every line qualifies; when outdenting, only lines that
+    // already start with the indent unit do. (Previously this condition relied
+    // on && / || precedence and was unreadable; behavior is unchanged.)
+    final qualifies = shouldIndent || line.startsWith(spaces);
+    if (qualifies) {
+      var shouldTransform = index + line.length >= selection.startIndex &&
           selection.endIndex >= index;
 
       if (shouldIndent && line.trim().isEmpty) {
@@ -369,42 +395,183 @@ CommandShortcutEventHandler _selectAllInCodeBlockCommandHandler =
 };
 
 CommandShortcutEventHandler _pasteInCodeBlock = (editorState) {
-  Selection? selection = editorState.selection;
-  if (selection == null) {
+  final initialSelection = editorState.selection;
+  if (initialSelection == null) {
     return KeyEventResult.ignored;
   }
 
-  if (editorState.getNodesInSelection(selection).length != 1) {
+  if (editorState.getNodesInSelection(initialSelection).length != 1) {
     return KeyEventResult.ignored;
   }
 
-  final node = editorState.getNodeAtPath(selection.end.path);
+  final node = editorState.getNodeAtPath(initialSelection.end.path);
   if (node == null || node.type != CodeBlockKeys.type) {
     return KeyEventResult.ignored;
   }
 
-  // delete the selection first.
-  if (!selection.isCollapsed) {
-    editorState.deleteSelection(selection);
-  }
-
-  // fetch selection again.
-  selection = editorState.selection;
-  if (selection == null) {
-    return KeyEventResult.skipRemainingHandlers;
-  }
-  assert(selection.isCollapsed);
-
-  () async {
-    final data = await AppFlowyClipboard.getData();
-    final text = data.text;
-    if (text != null && text.isNotEmpty) {
-      final transaction = editorState.transaction
-        ..insertText(node, selection!.end.offset, text);
-
-      await editorState.apply(transaction);
-    }
-  }();
+  // Perform the (possibly async) delete + insert off the synchronous handler
+  // path. The handler must return KeyEventResult synchronously, so we fire the
+  // future deliberately — but wrap it so exceptions are never swallowed.
+  unawaited(
+    _performCodeBlockPaste(editorState, node, initialSelection),
+  );
 
   return KeyEventResult.handled;
 };
+
+Future<void> _performCodeBlockPaste(
+  EditorState editorState,
+  Node node,
+  Selection initialSelection,
+) async {
+  try {
+    // delete the existing selection first, if any.
+    if (!initialSelection.isCollapsed) {
+      await editorState.deleteSelection(initialSelection);
+    }
+
+    // re-fetch selection after the potential delete.
+    final selection = editorState.selection;
+    if (selection == null || !selection.isCollapsed) {
+      return;
+    }
+
+    final data = await AppFlowyClipboard.getData();
+    final text = data.text;
+    if (text == null || text.isEmpty) {
+      return;
+    }
+
+    final transaction = editorState.transaction
+      ..insertText(node, selection.end.offset, text);
+
+    await editorState.apply(transaction);
+  } catch (e, stackTrace) {
+    AppFlowyEditorLog.editor.error(
+      'paste in code block failed: $e\n$stackTrace',
+    );
+  }
+}
+
+// Languages whose line-comment token is `#`. Everything else defaults to `//`.
+const _hashCommentLanguages = <String>{
+  'python',
+  'bash',
+  'shell',
+  'sh',
+  'ruby',
+  'perl',
+  'r',
+  'yaml',
+  'dockerfile',
+  'powershell',
+  'toml',
+  'makefile',
+  'gnuplot',
+};
+
+KeyEventResult _toggleCommentInCodeBlockCommandHandler(EditorState editorState) {
+  final selection = editorState.selection;
+  if (selection == null) {
+    return KeyEventResult.ignored;
+  }
+  final node = editorState.getNodeAtPath(selection.end.path);
+  final delta = node?.delta;
+  if (node == null || delta == null || node.type != CodeBlockKeys.type) {
+    return KeyEventResult.ignored;
+  }
+
+  final language = (node.attributes[CodeBlockKeys.language] as String?)
+          ?.toLowerCase() ??
+      '';
+  final commentToken =
+      _hashCommentLanguages.contains(language) ? '#' : '//';
+  final commentPrefix = '$commentToken ';
+
+  final text = delta.toPlainText();
+  final lines = text.split('\n');
+
+  // Collect (lineIndex, absoluteOffset) for each line that overlaps the
+  // selection. We mutate in reverse so earlier offsets stay valid.
+  final List<int> lineStartOffsets = [];
+  int index = 0;
+  for (var i = 0; i < lines.length; i++) {
+    final line = lines[i];
+    final lineEnd = index + line.length;
+    final overlaps = lineEnd >= selection.startIndex &&
+        selection.endIndex > index &&
+        line.trim().isNotEmpty;
+    if (overlaps) {
+      lineStartOffsets.add(index);
+    }
+    index = lineEnd + 1; // +1 for the '\n'
+  }
+
+  if (lineStartOffsets.isEmpty) {
+    return KeyEventResult.ignored;
+  }
+
+  // Decide whether to comment or uncomment by inspecting the first touched
+  // line: if its trimmed content starts with the token, we uncomment;
+  // otherwise we comment.
+  final firstLine = lines[_lineIndexForOffset(text, lineStartOffsets.first)];
+  final alreadyCommented = firstLine.trimLeft().startsWith(commentToken);
+
+  final transaction = editorState.transaction;
+  // net change in length, used to fix up the selection afterwards.
+  var deltaLen = 0;
+
+  for (final offset in lineStartOffsets.reversed) {
+    final lineIndex = _lineIndexForOffset(text, offset);
+    final line = lines[lineIndex];
+    final leadingWhitespaceLen = line.length - line.trimLeft().length;
+    final contentStart = offset + leadingWhitespaceLen;
+
+    if (alreadyCommented) {
+      // Remove one occurrence of commentPrefix (token + single trailing
+      // space if present) from the start of the line's content.
+      final tail = line.substring(leadingWhitespaceLen);
+      var removeLen = commentToken.length;
+      if (tail.length >= commentPrefix.length &&
+          tail.startsWith(commentPrefix)) {
+        removeLen = commentPrefix.length;
+      }
+      transaction.deleteText(node, contentStart, removeLen);
+      deltaLen -= removeLen;
+    } else {
+      transaction.insertText(node, contentStart, commentPrefix);
+      deltaLen += commentPrefix.length;
+    }
+  }
+
+  // Adjust the selection to account for the inserted/removed prefixes.
+  final touchedCount = lineStartOffsets.length;
+  final start = !selection.isBackward ? selection.end : selection.start;
+  final end = !selection.isBackward ? selection.start : selection.end;
+
+  final endOffset = alreadyCommented
+      ? end.offset - (commentPrefix.length * touchedCount)
+      : end.offset + (commentPrefix.length * touchedCount);
+  final startOffset = alreadyCommented
+      ? start.offset - commentPrefix.length
+      : start.offset + commentPrefix.length;
+
+  transaction.afterSelection = selection.copyWith(
+    start: start.copyWith(offset: startOffset.clamp(0, text.length + deltaLen)),
+    end: end.copyWith(offset: endOffset.clamp(0, text.length + deltaLen)),
+  );
+
+  editorState.apply(transaction);
+
+  return KeyEventResult.handled;
+}
+
+/// Returns the index of the line (0-based) that contains the given absolute
+/// [offset] within [text].
+int _lineIndexForOffset(String text, int offset) {
+  var lineIndex = 0;
+  for (var i = 0; i < offset && i < text.length; i++) {
+    if (text[i] == '\n') lineIndex++;
+  }
+  return lineIndex;
+}

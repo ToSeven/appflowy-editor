@@ -19,6 +19,11 @@ class ImageBlockKeys {
   /// It can be a url or a base64 string(web).
   static const String url = 'url';
 
+  /// Optional alt text / caption for the image (Markdown `![alt](url)`).
+  ///
+  /// The value is a String.
+  static const String alt = 'alt';
+
   /// The height of a image block.
   ///
   /// The value is a double.
@@ -33,6 +38,7 @@ class ImageBlockKeys {
 Node imageNode({
   required String url,
   String align = 'center',
+  String? alt,
   double? height,
   double? width,
 }) {
@@ -41,6 +47,7 @@ Node imageNode({
     attributes: {
       ImageBlockKeys.url: url,
       ImageBlockKeys.align: align,
+      if (alt != null) ImageBlockKeys.alt: alt,
       ImageBlockKeys.height: height,
       ImageBlockKeys.width: width,
     },
